@@ -4,7 +4,7 @@ Home Assistant card for a Deye hybrid inverter: live power of PV, grid, battery 
 
 One JavaScript file, no build step, no dependencies. Read-only: the card only shows states, it does not control anything.
 
-> Work in progress. The card now shows the five values as plain text; the flow diagram comes next.
+> Work in progress. The card shows the flow diagram with live values; direction, animation and clicks come next.
 
 ## Install (HACS)
 
