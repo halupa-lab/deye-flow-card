@@ -3,7 +3,7 @@
  *
  * Vanilla Web Component: no build step, no dependencies, read-only (no controls).
  */
-const CARD_VERSION = '0.1.1';
+const CARD_VERSION = '0.1.2';
 
 // Temporary name: the old hand-installed card owns `deye-flow-card` until this one replaces it.
 const CARD_TAG = 'deye-flow-card-dev';
@@ -47,6 +47,21 @@ const fmtW = (w) => {
 
 const fmtPct = (v) => (v == null ? '—' : `${Math.round(v)}%`);
 
+// MDI has battery icons in steps of 10 % (10..90, plus full and empty outline), with and without
+// "charging". Rounding to the nearest step, but full only from 99 %: 95 % should not look full.
+const batteryIcon = (soc, charging) => {
+  if (soc == null) return 'mdi:battery-unknown';
+  if (soc < 10) return charging ? 'mdi:battery-charging-outline' : 'mdi:battery-outline';
+  const step = soc >= 99 ? 100 : Math.min(90, Math.round(soc / 10) * 10);
+  if (charging) return `mdi:battery-charging-${step}`;
+  return step === 100 ? 'mdi:battery' : `mdi:battery-${step}`;
+};
+
+// Direction words follow the sign: plus = toward the inverter (import, discharge).
+// Within ±min_power the line counts as idle and the plain name is shown.
+const dirLabel = (name, w, min, plus, minus) =>
+  w == null || Math.abs(w) < min ? name : `${name}: ${w > 0 ? plus : minus}`;
+
 const STYLES = `
   ha-card { padding: 16px 16px 8px; }
   .title { font-size: 1.15rem; font-weight: 600; margin-bottom: 12px; color: var(--primary-text-color); }
@@ -74,6 +89,10 @@ const STYLES = `
   .caption { position: absolute; top: 100%; left: 50%; transform: translateX(-50%); margin-top: 4px; text-align: center; white-space: nowrap; }
   .value { font-size: 1.1rem; font-weight: 700; color: var(--primary-text-color); font-variant-numeric: tabular-nums; }
   .label { font-size: 0.8rem; color: var(--secondary-text-color); }
+  .node.na .box { opacity: 0.4; }
+  /* Grid outage: grey node and a dashed line, so "no grid" differs from "grid idle at 0 W". */
+  .node.off .box { --c: var(--disabled-text-color, #888); }
+  .line.off { stroke-dasharray: 2 2; }
 `;
 
 class DeyeFlowCard extends HTMLElement {
@@ -86,7 +105,14 @@ class DeyeFlowCard extends HTMLElement {
         throw new Error(`${CARD_TAG} (${view}): "${key}" is required (an entity ID)`);
       }
     }
-    this._config = { title: def.title, ...config, view };
+    this._config = {
+      title: def.title,
+      invert_battery: false, // true if the battery sensor is NEGATIVE while discharging
+      invert_grid: false,    // true if the grid sensor is NEGATIVE while importing
+      min_power: 15,         // W; below this a line counts as idle (sensor noise around zero)
+      ...config,
+      view,
+    };
     // The visual editor calls setConfig on every keystroke, so the DOM is rebuilt from the new config.
     this._built = false;
     if (this._hass) this._render();
@@ -187,15 +213,40 @@ class DeyeFlowCard extends HTMLElement {
       </div>`;
   }
 
+  _setIcon(id, icon) {
+    const el = this._el(id);
+    if (el && el.getAttribute('icon') !== icon) el.setAttribute('icon', icon);
+  }
+
   _update() {
     const c = this._config;
-    this._setText('val-pv', fmtW(this._watts(c.pv)));
-    this._setText('val-grid', fmtW(this._watts(c.grid)));
-    this._setText('val-battery', fmtW(this._watts(c.battery)));
-    this._setText('val-load', fmtW(this._watts(c.load)));
-    // SOC sits inside the battery box; `.extra:empty` hides it when there is no value.
+    const min = c.min_power;
+    const pv = this._watts(c.pv);
+    let grid = this._watts(c.grid);
+    let bat = this._watts(c.battery);
+    const load = this._watts(c.load);
     const soc = this._num(c.battery_soc);
+    // Normalise once here, so everything below can rely on one sign convention.
+    if (grid != null && c.invert_grid) grid = -grid;
+    if (bat != null && c.invert_battery) bat = -bat;
+
+    const values = { pv, grid, battery: bat, load };
+    for (const [k, v] of Object.entries(values)) {
+      this._setText(`val-${k}`, fmtW(v));
+      this._el(`node-${k}`).classList.toggle('na', v == null);
+    }
+
+    // Only an explicit "off" means an outage; a missing or unavailable status sensor changes nothing.
+    const gridSt = c.grid_status && this._hass.states[c.grid_status];
+    const gridOff = !!gridSt && gridSt.state === 'off';
+    this._el('node-grid').classList.toggle('off', gridOff);
+    this._el('path-grid').classList.toggle('off', gridOff);
+    this._setIcon('icon-grid', gridOff ? 'mdi:transmission-tower-off' : NODES.grid.icon);
+    this._setText('lbl-grid', gridOff ? `${NODES.grid.label}: немає` : dirLabel(NODES.grid.label, grid, min, 'імпорт', 'експорт'));
+    this._setText('lbl-battery', dirLabel(NODES.battery.label, bat, min, 'розряд', 'заряд'));
+    // SOC sits inside the battery box; `.extra:empty` hides it when there is no value.
     this._setText('extra-battery', soc == null ? '' : fmtPct(soc));
+    this._setIcon('icon-battery', batteryIcon(soc, bat != null && bat <= -min));
   }
 }
 
