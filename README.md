@@ -4,7 +4,7 @@ Home Assistant card for a Deye hybrid inverter: live power of PV, grid, battery 
 
 One JavaScript file, no build step, no dependencies. Read-only: the card only shows states, it does not control anything.
 
-> Work in progress. The card shows the flow diagram with live values and directions; animation and clicks come next.
+> Work in progress. The card shows the animated flow diagram with live values and directions; clicks come next.
 
 ## Install (HACS)
 
@@ -36,6 +36,9 @@ load: sensor.deye_inverter_load_power
 | `title` | no | Card title; `''` hides it |
 | `invert_grid` | no | `true` if your grid sensor is negative while importing. Default `false` |
 | `invert_battery` | no | `true` if your battery sensor is negative while discharging. Default `false` |
-| `min_power` | no | W; below this a line counts as idle. Default `15` |
+| `min_power` | no | W; below this a line counts as idle and has no moving dot. Default `15` |
+| `dot_speed` | no | Speed of the moving dots: `2` = twice as fast, `0.5` = twice as slow. Default `1` |
+
+The dots move faster with more power. With "reduce motion" turned on in the operating system, they are hidden.
 
 If a required key is missing, the card shows an error that names the key.

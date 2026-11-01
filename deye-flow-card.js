@@ -3,7 +3,7 @@
  *
  * Vanilla Web Component: no build step, no dependencies, read-only (no controls).
  */
-const CARD_VERSION = '0.1.2';
+const CARD_VERSION = '0.1.3';
 
 // Temporary name: the old hand-installed card owns `deye-flow-card` until this one replaces it.
 const CARD_TAG = 'deye-flow-card-dev';
@@ -62,6 +62,12 @@ const batteryIcon = (soc, charging) => {
 const dirLabel = (name, w, min, plus, minus) =>
   w == null || Math.abs(w) < min ? name : `${name}: ${w > 0 ? plus : minus}`;
 
+// Seconds for one dot to run the whole line: more power = faster dot (values from the reference).
+// `dot_speed` in YAML scales them.
+const baseDuration = (w) => (w < 500 ? 4.3 : w < 2000 ? 2.9 : w < 5000 ? 1.7 : 1.0);
+
+const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
 const STYLES = `
   ha-card { padding: 16px 16px 8px; }
   .title { font-size: 1.15rem; font-weight: 600; margin-bottom: 12px; color: var(--primary-text-color); }
@@ -93,9 +99,27 @@ const STYLES = `
   /* Grid outage: grey node and a dashed line, so "no grid" differs from "grid idle at 0 W". */
   .node.off .box { --c: var(--disabled-text-color, #888); }
   .line.off { stroke-dasharray: 2 2; }
+  /* The loop does not start either; this also hides dots if the setting changes while open. */
+  @media (prefers-reduced-motion: reduce) { .dot { display: none; } }
 `;
 
 class DeyeFlowCard extends HTMLElement {
+  constructor() {
+    super();
+    this._flows = {}; // key -> { dir: 'in' | 'out', dur: seconds, phase: 0..1 }, only active lines
+    this._raf = null;
+  }
+
+  // HA removes the card from the page when its dashboard view is left: no animation frames then.
+  connectedCallback() {
+    this._syncLoop();
+  }
+
+  disconnectedCallback() {
+    if (this._raf) cancelAnimationFrame(this._raf);
+    this._raf = null;
+  }
+
   setConfig(config) {
     const view = config.view || 'flow';
     const def = VIEWS[view];
@@ -110,6 +134,7 @@ class DeyeFlowCard extends HTMLElement {
       invert_battery: false, // true if the battery sensor is NEGATIVE while discharging
       invert_grid: false,    // true if the grid sensor is NEGATIVE while importing
       min_power: 15,         // W; below this a line counts as idle (sensor noise around zero)
+      dot_speed: 1,          // 2 = twice as fast, 0.5 = twice as slow
       ...config,
       view,
     };
@@ -183,6 +208,7 @@ class DeyeFlowCard extends HTMLElement {
       </ha-card>`;
     // textContent, not innerHTML: the title comes from user YAML.
     this._el('title').textContent = this._config.title || '';
+    this._flows = {};
     this._built = true;
   }
 
@@ -205,9 +231,13 @@ class DeyeFlowCard extends HTMLElement {
       )
       .join('');
     const lines = Object.entries(PATHS).map(([k, d]) => `<path id="path-${k}" d="${d}" class="line"/>`).join('');
+    // Dots after the lines, so they are drawn on top. The flow area is square, so r stays a circle.
+    const dots = Object.keys(PATHS)
+      .map((k) => `<circle id="dot-${k}" r="1.8" class="dot" style="fill:${COLORS[k]}" visibility="hidden"/>`)
+      .join('');
     return `
       <div class="flow">
-        <svg class="lines" viewBox="0 0 100 100" preserveAspectRatio="none">${lines}</svg>
+        <svg class="lines" viewBox="0 0 100 100" preserveAspectRatio="none">${lines}${dots}</svg>
         <div class="inverter" style="--c:var(--primary-color)"><div class="box"><ha-icon icon="mdi:current-ac"></ha-icon></div></div>
         ${nodes}
       </div>`;
@@ -247,6 +277,65 @@ class DeyeFlowCard extends HTMLElement {
     // SOC sits inside the battery box; `.extra:empty` hides it when there is no value.
     this._setText('extra-battery', soc == null ? '' : fmtPct(soc));
     this._setIcon('icon-battery', batteryIcon(soc, bat != null && bat <= -min));
+
+    // flow > 0 = energy goes TOWARD the inverter (the direction the paths are drawn in).
+    this._setDot('pv', pv);
+    this._setDot('grid', grid);
+    this._setDot('battery', bat);
+    this._setDot('load', load == null ? null : -load); // load always takes energy from the inverter
+    this._syncLoop();
+  }
+
+  // ---------- animation ----------
+
+  _setDot(key, flow) {
+    const c = this._config;
+    const active = flow != null && Math.abs(flow) >= c.min_power;
+    const speed = c.dot_speed > 0 ? c.dot_speed : 1;
+    if (active) {
+      // Keep the phase: when power changes, the dot changes speed instead of jumping.
+      const prev = this._flows[key];
+      this._flows[key] = {
+        dir: flow > 0 ? 'in' : 'out',
+        dur: baseDuration(Math.abs(flow)) / speed,
+        phase: prev ? prev.phase : 0,
+      };
+    } else {
+      delete this._flows[key];
+    }
+    const dot = this._el(`dot-${key}`);
+    const vis = active ? 'visible' : 'hidden';
+    if (dot && dot.getAttribute('visibility') !== vis) dot.setAttribute('visibility', vis);
+  }
+
+  // One requestAnimationFrame loop for all dots, running only while something moves and the card
+  // is on the page. The browser itself pauses frames while the tab or the app is in the background.
+  _syncLoop() {
+    const needed = this.isConnected && this._built && Object.keys(this._flows).length > 0 && !reducedMotion();
+    if (!needed) {
+      if (this._raf) cancelAnimationFrame(this._raf);
+      this._raf = null;
+      return;
+    }
+    if (this._raf) return;
+    let last = null;
+    const tick = (t) => {
+      this._raf = requestAnimationFrame(tick);
+      // Cap the step: after a pause in the background the dots continue instead of skipping ahead.
+      const dt = last == null ? 0 : Math.min(t - last, 100) / 1000;
+      last = t;
+      for (const [key, f] of Object.entries(this._flows)) {
+        const path = this._el(`path-${key}`);
+        const dot = this._el(`dot-${key}`);
+        if (!path || !dot) continue;
+        f.phase = (f.phase + dt / f.dur) % 1;
+        const pos = f.dir === 'in' ? f.phase : 1 - f.phase;
+        const pt = path.getPointAtLength(pos * path.getTotalLength());
+        dot.setAttribute('cx', pt.x.toFixed(2));
+        dot.setAttribute('cy', pt.y.toFixed(2));
+      }
+    };
+    this._raf = requestAnimationFrame(tick);
   }
 }
 
